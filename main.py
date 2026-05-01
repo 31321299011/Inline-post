@@ -1,18 +1,115 @@
-# main.py
 import asyncio
+import json
 import logging
 import random
 import string
+from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackQueryHandler, InlineQueryHandler, ContextTypes
-import aiosqlite
 
 # ---------- Bot config ----------
 BOT_TOKEN = "8264679566:AAFpbMd_g6Tbv3GfShREtCM0CW078ujPixY"
 BOT_USERNAME = "@inline_text_maker_bot"
 
-# ---------- Database ----------
-DB_PATH = "bot_data.db"
+# ---------- JSON Storage ----------
+DATA_FILE = "data.json"
+data_lock = asyncio.Lock()
+data = {"users": {}, "posts": []}  # in-memory
+
+async def load_data():
+    """Load JSON from file (blocking IO -> executor)."""
+    loop = asyncio.get_running_loop()
+    def _load():
+        if Path(DATA_FILE).exists():
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return {"users": {}, "posts": []}
+    result = await loop.run_in_executor(None, _load)
+    return result
+
+async def save_data():
+    """Save data dict to JSON file (blocking IO -> executor)."""
+    async with data_lock:
+        loop = asyncio.get_running_loop()
+        def _save():
+            with open(DATA_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        await loop.run_in_executor(None, _save)
+
+async def init_data():
+    global data
+    data = await load_data()
+    if "users" not in data:
+        data["users"] = {}
+    if "posts" not in data:
+        data["posts"] = []
+
+# ---------- Helpers ----------
+def generate_code():
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+
+async def get_user_lang(user_id):
+    async with data_lock:
+        user = data["users"].get(str(user_id), {})
+        return user.get("lang", "bn")  # default Bangla
+
+async def set_user_lang(user_id, lang):
+    async with data_lock:
+        data["users"][str(user_id)] = {"lang": lang}
+        await save_data()
+
+async def create_post(user_id, text, link, color_emoji):
+    async with data_lock:
+        while True:
+            code = generate_code()
+            # ensure code unique
+            if not any(p["code"] == code for p in data["posts"]):
+                new_post = {
+                    "id": len(data["posts"]) + 1,
+                    "user_id": user_id,
+                    "code": code,
+                    "text": text,
+                    "link": link,
+                    "color_emoji": color_emoji
+                }
+                data["posts"].append(new_post)
+                await save_data()
+                return code
+
+async def get_user_posts(user_id, limit=50):
+    async with data_lock:
+        posts = [p for p in data["posts"] if p["user_id"] == user_id]
+        posts.sort(key=lambda x: x["id"], reverse=True)
+        return posts[:limit]
+
+async def get_post_by_code(code):
+    async with data_lock:
+        for p in data["posts"]:
+            if p["code"] == code:
+                return p
+    return None
+
+async def get_post_by_id(post_id):
+    async with data_lock:
+        for p in data["posts"]:
+            if p["id"] == post_id:
+                return p
+    return None
+
+async def delete_post(post_id, user_id):
+    async with data_lock:
+        data["posts"] = [p for p in data["posts"] if not (p["id"] == post_id and p["user_id"] == user_id)]
+        await save_data()
+
+async def update_post(post_id, user_id, text, link, color_emoji):
+    async with data_lock:
+        for p in data["posts"]:
+            if p["id"] == post_id and p["user_id"] == user_id:
+                p["text"] = text
+                p["link"] = link
+                p["color_emoji"] = color_emoji
+                break
+        await save_data()
 
 # ---------- Language strings ----------
 STRINGS = {
@@ -24,7 +121,7 @@ STRINGS = {
         "developer_btn": "👨‍💻 Developer",
         "update_channel_btn": "📢 Update Channel",
         "send_format": "Send your post in this format:\n`Text | Link | Color_emoji`\nExample: `My Site | https://example.com | 🔴`\n(Color emoji is optional, default 🔵)",
-        "invalid_format": "❌ Invalid format! Please use `Text | Link | [Emoji]`.",
+        "invalid_format": "❌ Invalid format! Use `Text | Link | [Emoji]`.",
         "post_created": "✅ Post created!\n📌 Code: `{code}`\n\nUsage: Type @inline_text_maker_bot {code} in any chat.",
         "no_posts": "You have no posts yet.",
         "post_deleted": "❌ Post deleted.",
@@ -38,7 +135,8 @@ STRINGS = {
         "post_not_found": "Post not found.",
         "choose_lang": "Choose language:",
         "cancel_text": "Action cancelled.",
-        "back_to_menu": "Back to menu."
+        "back_to_menu": "Back to menu.",
+        "delete_confirm": "Delete this post? (yes/no)"
     },
     "bn": {
         "start": "স্বাগতম! আমি ইনলাইন টেক্সট মেকার বট 💠\nআপনি নিজের কাস্টম ইনলাইন বাটন পোস্ট তৈরি করে যেকোনো চ্যাটে শেয়ার করতে পারবেন।",
@@ -62,7 +160,8 @@ STRINGS = {
         "post_not_found": "পোস্ট পাওয়া যায়নি।",
         "choose_lang": "ভাষা বাছাই করুন:",
         "cancel_text": "কাজ বাতিল করা হয়েছে।",
-        "back_to_menu": "মেনুতে ফিরুন।"
+        "back_to_menu": "মেনুতে ফিরুন।",
+        "delete_confirm": "এই পোস্ট ডিলিট করবেন? (হ্যাঁ/না)"
     },
     "ru": {
         "start": "Добро пожаловать! Я Inline Text Maker 💠\nСоздавайте кастомные посты с инлайн‑кнопками и делитесь ими везде.",
@@ -86,7 +185,8 @@ STRINGS = {
         "post_not_found": "Пост не найден.",
         "choose_lang": "Выберите язык:",
         "cancel_text": "Действие отменено.",
-        "back_to_menu": "Вернуться в меню."
+        "back_to_menu": "Вернуться в меню.",
+        "delete_confirm": "Удалить этот пост? (да/нет)"
     },
     "hi": {
         "start": "स्वागत है! मैं Inline Text Maker 💠\nआप कस्टम इनलाइन बटन पोस्ट बना सकते हैं और कहीं भी शेयर कर सकते हैं।",
@@ -110,141 +210,47 @@ STRINGS = {
         "post_not_found": "पोस्ट नहीं मिला।",
         "choose_lang": "भाषा चुनें:",
         "cancel_text": "कार्रवाई रद्द कर दी गई।",
-        "back_to_menu": "मेनू पर वापस जाएं।"
+        "back_to_menu": "मेनू पर वापस जाएं।",
+        "delete_confirm": "इस पोस्ट को हटाएं? (हाँ/ना)"
     }
 }
 
-# ---------- Helpers ----------
-def generate_code():
-    """Generate a 6‑char alphanumeric code."""
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-
-async def get_db():
-    """Return a database connection (create if needed)."""
-    return await aiosqlite.connect(DB_PATH)
-
-async def init_db():
-    """Initialize database tables."""
-    db = await get_db()
-    await db.execute('''CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        lang TEXT DEFAULT 'bn'
-    )''')
-    await db.execute('''CREATE TABLE IF NOT EXISTS posts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        code TEXT UNIQUE,
-        text TEXT,
-        link TEXT,
-        color_emoji TEXT DEFAULT '🔵'
-    )''')
-    await db.commit()
-    await db.close()
-
-# ---------- Database operations ----------
-async def get_user_lang(user_id):
-    db = await get_db()
-    cursor = await db.execute('SELECT lang FROM users WHERE user_id = ?', (user_id,))
-    row = await cursor.fetchone()
-    await db.close()
-    return row[0] if row else 'bn'  # default Bangla
-
-async def set_user_lang(user_id, lang):
-    db = await get_db()
-    await db.execute('INSERT INTO users (user_id, lang) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET lang = ?',
-                     (user_id, lang, lang))
-    await db.commit()
-    await db.close()
-
-async def create_post(user_id, text, link, color_emoji):
-    db = await get_db()
-    while True:
-        code = generate_code()
-        try:
-            await db.execute('INSERT INTO posts (user_id, code, text, link, color_emoji) VALUES (?, ?, ?, ?, ?)',
-                             (user_id, code, text, link, color_emoji))
-            await db.commit()
-            break
-        except aiosqlite.IntegrityError:  # code collision, regenerate
-            continue
-    await db.close()
-    return code
-
-async def get_user_posts(user_id, limit=50):
-    db = await get_db()
-    cursor = await db.execute('SELECT id, code, text, link, color_emoji FROM posts WHERE user_id = ? ORDER BY id DESC LIMIT ?',
-                              (user_id, limit))
-    rows = await cursor.fetchall()
-    await db.close()
-    return [{'id': r[0], 'code': r[1], 'text': r[2], 'link': r[3], 'color_emoji': r[4]} for r in rows]
-
-async def get_post_by_code(code):
-    db = await get_db()
-    cursor = await db.execute('SELECT id, user_id, text, link, color_emoji FROM posts WHERE code = ?', (code,))
-    row = await cursor.fetchone()
-    await db.close()
-    if row:
-        return {'id': row[0], 'user_id': row[1], 'text': row[2], 'link': row[3], 'color_emoji': row[4]}
-    return None
-
-async def get_post_by_id(post_id):
-    db = await get_db()
-    cursor = await db.execute('SELECT id, user_id, text, link, color_emoji, code FROM posts WHERE id = ?', (post_id,))
-    row = await cursor.fetchone()
-    await db.close()
-    if row:
-        return {'id': row[0], 'user_id': row[1], 'text': row[2], 'link': row[3], 'color_emoji': row[4], 'code': row[5]}
-    return None
-
-async def delete_post(post_id, user_id):
-    db = await get_db()
-    await db.execute('DELETE FROM posts WHERE id = ? AND user_id = ?', (post_id, user_id))
-    await db.commit()
-    await db.close()
-
-async def update_post(post_id, user_id, text, link, color_emoji):
-    db = await get_db()
-    await db.execute('UPDATE posts SET text = ?, link = ?, color_emoji = ? WHERE id = ? AND user_id = ?',
-                     (text, link, color_emoji, post_id, user_id))
-    await db.commit()
-    await db.close()
-
-# ---------- State management (in memory) ----------
-# user_state: {user_id: {'action': 'awaiting_post' or 'awaiting_edit', 'post_id': int} }
-user_states = {}
+# ---------- State management ----------
+user_states = {}  # {user_id: {"action": "awaiting_post" or "awaiting_edit", "post_id": int}}
 
 # ---------- Keyboards ----------
 def main_menu_keyboard(lang):
     s = STRINGS[lang]
-    keyboard = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton(s["create_btn"], callback_data="create_post")],
         [InlineKeyboardButton(s["my_posts_btn"], callback_data="my_posts")],
         [InlineKeyboardButton(s["language_btn"], callback_data="change_lang")],
         [InlineKeyboardButton(s["developer_btn"], callback_data="developer")],
         [InlineKeyboardButton(s["update_channel_btn"], url="https://t.me/earning_channel24")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    ])
 
 def cancel_keyboard(lang):
     s = STRINGS[lang]
     return InlineKeyboardMarkup([[InlineKeyboardButton(s["cancel"], callback_data="cancel_action")]])
 
 def language_keyboard():
-    buttons = [
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("🇧🇩 বাংলা", callback_data="lang_bn"),
          InlineKeyboardButton("🇬🇧 English", callback_data="lang_en")],
         [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang_ru"),
          InlineKeyboardButton("🇮🇳 हिन्दी", callback_data="lang_hi")]
-    ]
-    return InlineKeyboardMarkup(buttons)
+    ])
 
 def post_actions_keyboard(post_id, lang):
     s = STRINGS[lang]
-    buttons = [
-        InlineKeyboardButton(s["post_deleted"].replace("❌", "🗑️"), callback_data=f"delete_{post_id}"),
-        InlineKeyboardButton(s["post_updated"].split(" ")[0] + " ✏️", callback_data=f"edit_{post_id}")
-    ]
-    return InlineKeyboardMarkup([buttons])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🗑️", callback_data=f"delete_{post_id}"),
+         InlineKeyboardButton("✏️", callback_data=f"edit_{post_id}")]
+    ])
+
+def back_button(lang):
+    s = STRINGS[lang]
+    return InlineKeyboardMarkup([[InlineKeyboardButton(s["back_to_menu"], callback_data="back_to_menu")]])
 
 # ---------- Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -262,7 +268,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
 
     if data == "create_post":
-        user_states[user_id] = {'action': 'awaiting_post'}
+        user_states[user_id] = {"action": "awaiting_post"}
         await query.edit_message_text(s["send_format"], parse_mode="Markdown", reply_markup=cancel_keyboard(lang))
     elif data == "my_posts":
         posts = await get_user_posts(user_id)
@@ -274,9 +280,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text += f"🔹 {p['color_emoji']} {p['text']}  —  `{p['code']}`\n"
             text += "\n" + s["inline_help"]
             await query.edit_message_text(text, parse_mode="Markdown",
-                                          reply_markup=InlineKeyboardMarkup([
-                                              [InlineKeyboardButton(s["back_to_menu"], callback_data="back_to_menu")]
-                                          ]))
+                                          reply_markup=post_actions_keyboard(posts[0]["id"], lang) if posts else back_button(lang))
+            # Actually we should show action buttons per post... but we can't in one message easily.
+            # We'll just show list and then user can select via inline buttons for each? Better to send one message per post? 
+            # Let's simplify: show the list with "done" button, and user can do delete/edit via separate management? 
+            # We'll provide a list with a button for each post? That's messy. We'll instead change approach: 
+            # When user clicks My Posts, show a gallery of inline buttons for each post to manage? 
+            # Let's modify: we'll show a short list and ask user to click on post code? 
+            # I'll just show a numbered list with delete/edit options as keyboard per post? Need to redesign.
+            # But keep simple for now: show only the list + done button. User can delete/edit by sending a command? 
+            # The user requested ability to delete/edit. They can do it via inline query? Actually we had delete/edit callbacks on each post. 
+            # We'll implement: after showing list, we'll provide a row of buttons for each post? Not scalable.
+            # Better: Show list and add inline keyboard "Manage Posts" which shows a paginated picker. 
+            # Since we need full working, let's do this: 
+            # "My Posts" will show a message "Select a post to manage:" and then a keyboard with first few posts as buttons. 
+            # But that's too many buttons. We'll limit to 5 posts per page. 
+            # This is getting big. I'll just use a simple approach: 
+            # Show list, and below that a message "To delete or edit, use /delete <code> or /edit <code>". But user wanted inline buttons.
+            # I'll keep the original concept: In the list, each post shown with its delete/edit buttons. We'll build a large keyboard with buttons for each post? 
+            # That's possible but ugly. However user don't mind. I'll create a keyboard with each post as a pair of buttons: (Delete, Edit). 
+            # Let's do a keyboard where each row is for a post: [🗑️ {code}, ✏️ {code}]. But button text must be short.
+            # We'll use 🗑️ and ✏️ and callback data with post id.
+            # We'll limit to 10 posts to avoid too many buttons.
+            # I'll implement:
+            if len(posts) > 10:
+                posts = posts[:10]
+                text += "\n(Showing last 10 posts)"
+            kb = []
+            for p in posts:
+                kb.append([
+                    InlineKeyboardButton(f"🗑️ {p['code']}", callback_data=f"delete_{p['id']}"),
+                    InlineKeyboardButton(f"✏️ {p['code']}", callback_data=f"edit_{p['id']}")
+                ])
+            kb.append([InlineKeyboardButton(s["back_to_menu"], callback_data="back_to_menu")])
+            await query.edit_message_text(text, parse_mode="Markdown",
+                                          reply_markup=InlineKeyboardMarkup(kb))
     elif data == "change_lang":
         await query.edit_message_text(s["choose_lang"], reply_markup=language_keyboard())
     elif data.startswith("lang_"):
@@ -287,41 +325,38 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(s["language_selected"], reply_markup=main_menu_keyboard(lang))
     elif data == "developer":
         dev_text = "👨‍💻 Developers:\n@Bot_developer_io & @jhgmaing"
-        await query.edit_message_text(dev_text, reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(s["back_to_menu"], callback_data="back_to_menu")]
-        ]))
+        await query.edit_message_text(dev_text, reply_markup=back_button(lang))
     elif data == "back_to_menu":
         if user_id in user_states:
             del user_states[user_id]
         await query.edit_message_text(s["start"], reply_markup=main_menu_keyboard(lang))
     elif data.startswith("delete_"):
         post_id = int(data.split("_")[1])
-        # confirm deletion
-        await query.edit_message_text("Delete this post? (yes/no)",
-                                       reply_markup=InlineKeyboardMarkup([
-                                           [InlineKeyboardButton("✅ Yes", callback_data=f"confirm_delete_{post_id}"),
-                                            InlineKeyboardButton("❌ No", callback_data="my_posts")]
-                                       ]))
-    elif data.startswith("edit_"):
-        post_id = int(data.split("_")[1])
-        post = await get_post_by_id(post_id)
-        if not post or post['user_id'] != user_id:
-            await query.edit_message_text(s["unauthorized"])
-            return
-        user_states[user_id] = {'action': 'awaiting_edit', 'post_id': post_id}
-        await query.edit_message_text(f"Editing post `{post['code']}`:\n" + s["edit_prompt"],
-                                      parse_mode="Markdown", reply_markup=cancel_keyboard(lang))
+        # Confirm delete
+        await query.edit_message_text(s["delete_confirm"], reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Yes", callback_data=f"confirm_delete_{post_id}"),
+             InlineKeyboardButton("❌ No", callback_data="my_posts")]
+        ]))
     elif data.startswith("confirm_delete_"):
         post_id = int(data.split("_")[2])
         await delete_post(post_id, user_id)
         await query.edit_message_text(s["post_deleted"], reply_markup=main_menu_keyboard(lang))
+    elif data.startswith("edit_"):
+        post_id = int(data.split("_")[1])
+        post = await get_post_by_id(post_id)
+        if not post or post["user_id"] != user_id:
+            await query.edit_message_text(s["unauthorized"])
+            return
+        user_states[user_id] = {"action": "awaiting_edit", "post_id": post_id}
+        await query.edit_message_text(f"Editing post `{post['code']}`:\n" + s["edit_prompt"],
+                                      parse_mode="Markdown", reply_markup=cancel_keyboard(lang))
     elif data == "cancel_action":
         if user_id in user_states:
             del user_states[user_id]
         await query.edit_message_text(s["cancel_text"], reply_markup=main_menu_keyboard(lang))
-
     else:
-        await query.edit_message_text("Unknown action.")
+        # Fallback
+        await query.edit_message_text("Unknown action.", reply_markup=main_menu_keyboard(lang))
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -330,34 +365,31 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = await get_user_lang(user_id)
     s = STRINGS[lang]
 
-    if state and state['action'] == 'awaiting_post':
-        # Parse format: text | link | [color_emoji]
-        parts = [p.strip() for p in text.split('|')]
+    if state and state["action"] == "awaiting_post":
+        parts = [p.strip() for p in text.split("|")]
         if len(parts) < 2 or len(parts) > 3:
             await update.message.reply_text(s["invalid_format"])
             return
         post_text = parts[0]
         link = parts[1]
-        color_emoji = parts[2] if len(parts) == 3 else '🔵'
-        if not link.startswith(('http://', 'https://')):
+        color_emoji = parts[2] if len(parts) == 3 else "🔵"
+        if not link.startswith(("http://", "https://")):
             await update.message.reply_text("❌ Invalid link. Must start with http:// or https://")
             return
         code = await create_post(user_id, post_text, link, color_emoji)
         del user_states[user_id]
-        await update.message.reply_text(s["post_created"].format(code=code),
-                                        reply_markup=main_menu_keyboard(lang))
-    elif state and state['action'] == 'awaiting_edit':
-        # Parse similar
-        parts = [p.strip() for p in text.split('|')]
+        await update.message.reply_text(s["post_created"].format(code=code), reply_markup=main_menu_keyboard(lang))
+    elif state and state["action"] == "awaiting_edit":
+        parts = [p.strip() for p in text.split("|")]
         if len(parts) < 2 or len(parts) > 3:
             await update.message.reply_text(s["invalid_format"])
             return
         post_text = parts[0]
         link = parts[1]
-        color_emoji = parts[2] if len(parts) == 3 else '🔵'
-        post_id = state['post_id']
+        color_emoji = parts[2] if len(parts) == 3 else "🔵"
+        post_id = state["post_id"]
         post = await get_post_by_id(post_id)
-        if not post or post['user_id'] != user_id:
+        if not post or post["user_id"] != user_id:
             await update.message.reply_text(s["unauthorized"])
             del user_states[user_id]
             return
@@ -365,7 +397,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         del user_states[user_id]
         await update.message.reply_text(s["post_updated"], reply_markup=main_menu_keyboard(lang))
     else:
-        # If not in any state, just show menu
+        # No active state – show menu
         await update.message.reply_text(s["start"], reply_markup=main_menu_keyboard(lang))
 
 async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -380,13 +412,12 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         for p in posts:
             button_text = f"{p['color_emoji']} {p['text']}"
             markup = InlineKeyboardMarkup([[InlineKeyboardButton(button_text, url=p['link'])]])
-            # Use code as title
             result = InlineQueryResultArticle(
-                id=str(p['id']),
+                id=str(p["id"]),
                 title=f"📌 {p['code']} : {p['text'][:30]}",
                 input_message_content=InputTextMessageContent(message_text=f"🔗 {p['text']}"),
                 reply_markup=markup,
-                description=p['link']
+                description=p["link"]
             )
             results.append(result)
     else:
@@ -396,11 +427,11 @@ async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYP
             button_text = f"{post['color_emoji']} {post['text']}"
             markup = InlineKeyboardMarkup([[InlineKeyboardButton(button_text, url=post['link'])]])
             result = InlineQueryResultArticle(
-                id=str(post['id']),
+                id=str(post["id"]),
                 title=f"📌 {post['code']} : {post['text'][:30]}",
                 input_message_content=InputTextMessageContent(message_text=f"🔗 {post['text']}"),
                 reply_markup=markup,
-                description=post['link']
+                description=post["link"]
             )
             results.append(result)
 
@@ -411,24 +442,20 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Main ----------
 async def main():
-    await init_db()
+    logging.basicConfig(level=logging.INFO)
+    await init_data()
+    random.seed()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Handlers
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     app.add_handler(InlineQueryHandler(inline_query_handler))
     app.add_error_handler(error_handler)
 
-    # Commands for easier access
-    app.add_handler(CommandHandler("myposts", lambda u, c: button_handler(u, c)))  # redirect
-
-    # Start bot
     print("Bot is running...")
     await app.run_polling()
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    random.seed()
     asyncio.run(main())
